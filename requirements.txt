@@ -1,0 +1,14 @@
+pymupdf
+python-docx
+chromadb
+sentence-transformers
+langgraph
+langchain-core
+langchain-ollama
+fastapi
+uvicorn[standard]
+streamlit
+pydantic
+pyyaml
+sqlalchemy
+watchdog

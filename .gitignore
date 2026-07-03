@@ -1,0 +1,33 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Data & indexes (local only)
+data/chroma/
+data/*.db
+jd_files/
+
+# Logs & PIDs
+*.log
+*.pid
+ui.pid
+backend.pid
+
+# Node
+ui/node_modules/
+ui/.vite/
+ui/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*

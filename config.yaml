@@ -1,0 +1,31 @@
+# ── AI Placement Intelligence Agent — Configuration ──────────────────────────
+
+paths:
+  jd_files:  "jd_files"          # drop your PDF / DOCX files here
+  chroma_db: "data/chroma"       # ChromaDB vector store
+  sqlite_db: "data/metadata.db"  # SQLite metadata database
+
+embedding:
+  model: "BAAI/bge-small-en-v1.5"
+  batch_size: 32
+  instruction: "Represent this job description for retrieval: "
+
+chunking:
+  chunk_size: 400                 # tokens per chunk
+  chunk_overlap: 60               # overlap between consecutive chunks
+
+llm:
+  model: "llama3.2:latest"
+  base_url: "http://localhost:11434"
+  temperature: 0.1
+  timeout_seconds: 120
+
+retrieval:
+  top_k: 5                        # number of chunks to retrieve
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+logging:
+  level: "INFO"
