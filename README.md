@@ -545,13 +545,66 @@ A useful way to remember the separation of concerns is:
 - **Automatic indexer asks:** “What should the system do with this parsed document so it becomes searchable?”
 
 ```mermaid
-flowchart LR
-    A["discovery.py<br/>Detect + identify change"] -->|PipelineEvent| B[["Queue"]]
-    B --> C["automatic_indexer.py<br/>Orchestrate processing"]
-    C -->|file path + doc ID| D["parser.py<br/>PDF / DOCX → ParsedDocument"]
-    D --> C
-    C --> E["Metadata + chunks + embeddings"]
-    E --> F[("SQLite + ChromaDB")]
+flowchart TB
+    subgraph DISCOVERY["1. DISCOVERY — detect what changed"]
+        A["discovery.py<br/>Startup rescan + Watchdog events"]
+        A --> B["Validate file + compare SHA-256"]
+        B --> C["Create PipelineEvent<br/>created / modified / deleted"]
+    end
+
+    C --> Q[["Thread-safe event queue"]]
+
+    subgraph INDEXER["2. AUTOMATIC INDEXER — coordinate the work"]
+        Q --> W["automatic_indexer.py<br/>Background worker consumes event"]
+        W --> T{"Event type?"}
+    end
+
+    subgraph INDEX["3A. NEW OR MODIFIED DOCUMENT"]
+        T -->|Created / modified| S["Set status = indexing"]
+        S --> P["parser.py<br/>Read PDF / DOCX"]
+        P --> PD["ParsedDocument"]
+        PD --> M["Extract structured metadata"]
+        M --> CH["Split text into semantic chunks"]
+        CH --> EM["Generate embeddings"]
+        EM --> STORE["Write metadata to SQLite<br/>and vectors/chunks to ChromaDB"]
+        STORE --> OK["Set status = indexed"]
+        OK --> INV["Invalidate query + analytics caches<br/>(if configured)"]
+    end
+
+    subgraph DELETE["3B. DELETED DOCUMENT"]
+        T -->|Deleted| RM["Remove document data<br/>from SQLite + ChromaDB"]
+        RM --> DEL["Update document status"]
+        DEL --> INVDEL["Invalidate query + analytics caches<br/>(if configured)"]
+    end
+
+    subgraph FAILURE["4. FAILURE PATH"]
+        S -. "Any indexing step raises an exception" .-> ERR["Catch exception + record reason"]
+        P -.-> ERR
+        M -.-> ERR
+        CH -.-> ERR
+        EM -.-> ERR
+        STORE -.-> ERR
+        ERR --> RB["Attempt rollback of current<br/>uncommitted DB transaction"]
+        RB --> FAIL["Attempt to set status = failed"]
+    end
+
+    subgraph MONITOR["5. STATUS / OBSERVABILITY"]
+        STATUS["get_status()"]
+        STATUS --- DETAILS["Worker running • queue depth<br/>current file • indexed / failed counts<br/>last successful indexing time"]
+    end
+
+    classDef discovery fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef coordination fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef processing fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef storage fill:#cffafe,stroke:#0891b2,color:#164e63
+    classDef success fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef failure fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    class A,B,C discovery
+    class Q,W,T coordination
+    class S,P,PD,M,CH,EM processing
+    class STORE,RM storage
+    class OK,INV,DEL,INVDEL success
+    class ERR,RB,FAIL failure
 ```
 
 ### 2. Metadata extraction
