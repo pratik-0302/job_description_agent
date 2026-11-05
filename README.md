@@ -1113,59 +1113,141 @@ Here, `rank_r(d)` is the position of document `d` in retriever `r`, and the impl
 
 **Relevant modules:** `src/retrieval/hybrid_retriever.py` and `src/retrieval/result_fusion.py`.
 
-### 6. Intent detection and agent workflow
+### 6. Intent detection and LangGraph query workflow
 
-The intent detector classifies a question into a query category using keyword and pattern rules. The categories implemented include:
+A user query does not go directly to the LLM. The FastAPI endpoint first checks the query cache, then invokes a **stateful LangGraph workflow**. LangGraph routes the query to the appropriate agent node, which gathers the required data, generates a response where applicable, and passes the result through common post-processing nodes.
 
-| Intent | Example question | Purpose |
-|---|---|---|
-| Search | “Find ML engineer roles” | Search job descriptions |
-| Compare | “Compare Company A vs Company B” | Compare opportunities |
-| Recommend | “Which jobs match my profile?” | Apply profile/eligibility criteria |
-| Analytics | “What is the average package?” | Explore aggregate placement information |
-| Summary | “Summarize this role” | Explain a role or JD |
-| Follow-up | “What about that company’s deadline?” | Resolve a reference to earlier conversation context |
+#### 6.1 Request entry: API and query cache
 
-LangGraph coordinates the workflow using a shared state. Nodes update parts of that state, and graph routing determines which operation should run next. The graph also uses a SQLite-backed checkpointer for conversation/thread persistence.
+When the frontend sends a question to `POST /api/query`, the backend:
+
+1. Builds a cache key from the session ID and query text.
+2. Checks the in-memory query cache (maximum 100 entries, 300-second TTL).
+3. Returns the cached response immediately on a cache hit.
+4. On a cache miss, invokes the compiled LangGraph with the query and a `thread_id` equal to the session ID.
+
+The `thread_id` lets the SQLite-backed LangGraph checkpointer keep graph state associated with a conversation thread.
 
 ```mermaid
 flowchart TB
-    subgraph ROUTING["1. DETECT USER INTENT"]
-        START(["New user message"]) --> INTENT["Intent router"]
-        INTENT --> FOLLOW["Resolve follow-up reference<br/>when required"]
-        FOLLOW --> ROUTE{"Detected intent"}
-    end
-
-    subgraph WORKFLOWS["2. ROUTE TO THE APPROPRIATE WORKFLOW"]
-        ROUTE -->|Search| SEARCH["Search workflow"]
-        ROUTE -->|Compare| COMPARE["Comparison workflow"]
-        ROUTE -->|Recommend| RECOMMEND["Recommendation workflow"]
-        ROUTE -->|Analytics| ANALYTICS["Analytics workflow"]
-        ROUTE -->|Summary| SUMMARY["Summary workflow"]
-    end
-
-    subgraph RESPONSE["3. BUILD THE RESPONSE"]
-        SEARCH --> BUILD["Build agent response"]
-        COMPARE --> BUILD
-        RECOMMEND --> BUILD
-        ANALYTICS --> BUILD
-        SUMMARY --> BUILD
-        BUILD --> END(["Return response"])
-    end
+    USER["User question<br/>query_text + session_id"] --> API["FastAPI<br/>POST /api/query"]
+    API --> KEY["Build cache key<br/>session_id : query_text"]
+    KEY --> CACHE{"Query cache hit?"}
+    CACHE -->|Yes| RETURN["Return cached response"]
+    CACHE -->|No| STATE["Create initial graph state<br/>query_text, resolved_query, intent"]
+    STATE --> INVOKE["Invoke LangGraph<br/>thread_id = session_id"]
+    INVOKE --> GRAPH["LangGraph workflow"]
+    GRAPH --> SAVE["Cache final response<br/>300-second TTL"]
+    SAVE --> RETURN2["Return response to frontend"]
 
     classDef input fill:#dbeafe,stroke:#2563eb,color:#172554
-    classDef route fill:#ede9fe,stroke:#7c3aed,color:#3b0764
-    classDef workflow fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef process fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef decision fill:#ede9fe,stroke:#7c3aed,color:#3b0764
     classDef output fill:#dcfce7,stroke:#16a34a,color:#14532d
-    class START input
-    class INTENT,FOLLOW,ROUTE route
-    class SEARCH,COMPARE,RECOMMEND,ANALYTICS,SUMMARY workflow
-    class BUILD,END output
+    class USER input
+    class API,KEY,STATE,INVOKE,GRAPH,SAVE process
+    class CACHE decision
+    class RETURN,RETURN2 output
 ```
 
-The exact operations differ by intent. For example, recommendations can apply student profile filters before semantic ranking, while comparisons collect metadata for the companies mentioned in the question.
+#### 6.2 LangGraph state and intent routing
 
-**Relevant modules:** `src/retrieval/intent_detector.py` and `src/agents/agent_graph.py`.
+The graph shares an `AgentState` dictionary between nodes. Depending on the path, it can contain:
+
+| State field | Purpose |
+|---|---|
+| `query_text` | Original user question |
+| `resolved_query` | Query after follow-up reference resolution |
+| `intent` | Selected workflow: search, compare, recommend, analytics, summary, or followup |
+| `user_profile` | Student criteria such as CGPA, branch, skills, and preferences |
+| `source_documents` / `retrieved_chunks` | Evidence collected by retrieval-oriented agents |
+| `response_text` / `structured_data` | Generated answer and optional structured output |
+| `turn_history` | Conversation turns used by follow-up handling |
+| `final_response` | Formatted response returned by the graph |
+
+The `IntentDetector` is **rule-based**, not an LLM classifier. It checks explicit follow-up patterns first, then comparison keywords, analytics keywords, recommendation keywords, and summary keywords. If none match, it defaults to `search`.
+
+```mermaid
+flowchart TB
+    START(["Graph entry"]) --> ROUTER["intent_router<br/>IntentDetector.detect_intent(query_text)"]
+    ROUTER --> INTENT{"Intent?"}
+    INTENT -->|followup| FOLLOW["followup_resolver"]
+    INTENT -->|search| SEARCH["search node"]
+    INTENT -->|compare| COMPARE["compare node"]
+    INTENT -->|recommend| RECOMMEND["recommend node"]
+    INTENT -->|analytics| ANALYTICS["analytics node"]
+    INTENT -->|summary| SUMMARY["summary node"]
+
+    FOLLOW --> RESOLVE["Resolve explicit reference<br/>using prior turn history when available"]
+    RESOLVE --> RECHECK["Re-detect intent<br/>default unresolved followup to search"]
+    RECHECK --> TARGET{"Resolved intent"}
+    TARGET -->|search| SEARCH
+    TARGET -->|compare| COMPARE
+    TARGET -->|recommend| RECOMMEND
+    TARGET -->|analytics| ANALYTICS
+    TARGET -->|summary| SUMMARY
+
+    classDef start fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef route fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef agent fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    class START start
+    class ROUTER,INTENT,FOLLOW,RESOLVE,RECHECK,TARGET route
+    class SEARCH,COMPARE,RECOMMEND,ANALYTICS,SUMMARY agent
+```
+
+The follow-up resolver looks through prior turns for a referenced company and appends that company to queries containing references such as "this company", "their deadline", "salary", or "eligibility". It then detects the intent again and sends the resolved query to the corresponding agent.
+
+#### 6.3 What each agent node actually does
+
+| LangGraph node | Main operations | Data sources / output |
+|---|---|---|
+| `search` | Runs hybrid retrieval, assembles evidence, builds a search prompt, and calls Ollama | SQLite + ChromaDB → answer and source documents |
+| `recommend` | Applies profile-based eligibility filters in SQLite, embeds the query, searches ChromaDB within eligible document IDs, fuses results, and calls Ollama | Student profile + SQLite + ChromaDB → recommendations |
+| `compare` | Extracts known company names, fetches their metadata and chunks, builds a comparison prompt, and checks key numeric facts in the generated answer | SQLite + ChromaDB → comparison and structured matrix |
+| `analytics` | Calculates counts, average and maximum CTC, and location distribution directly from SQLite; asks Ollama to explain the metrics | SQLite → analytics text and structured statistics |
+| `summary` | Finds the requested company in SQLite, fetches its chunks from ChromaDB, and asks Ollama for a JD summary | SQLite + ChromaDB → summary and source |
+ 
+If comparison cannot identify at least two companies, it falls back to the normal search retrieval path. If summary cannot identify a specific company record, it also falls back to hybrid retrieval.
+
+#### 6.4 Common post-processing and response
+
+All five agent nodes lead to two shared nodes:
+
+1. **`preference_extractor`:** extracts profile details from the original query (such as package, CGPA, job type, locations, and skills) and merges them into the graph's `user_profile`.
+2. **`response_formatter`:** creates the response ID, attaches sources and structured data, adds default follow-up suggestions, updates the conversation turn history, and writes `final_response`.
+
+```mermaid
+flowchart TB
+    subgraph AGENTS["1. INTENT-SPECIFIC AGENT"]
+        SEARCH["search"]
+        RECOMMEND["recommend"]
+        COMPARE["compare"]
+        ANALYTICS["analytics"]
+        SUMMARY["summary"]
+    end
+
+    PROFILE["preference_extractor<br/>Extract and update student profile"]
+    FORMAT["response_formatter<br/>Create response ID, attach sources,<br/>suggestions and update turn history"]
+    FINAL(["final_response"])
+    SEARCH --> PROFILE
+    RECOMMEND --> PROFILE
+    COMPARE --> PROFILE
+    ANALYTICS --> PROFILE
+    SUMMARY --> PROFILE
+    PROFILE --> FORMAT
+    FORMAT --> FINAL
+
+    classDef agent fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef shared fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef output fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class SEARCH,RECOMMEND,COMPARE,ANALYTICS,SUMMARY agent
+    class PROFILE,FORMAT shared
+    class FINAL output
+```
+
+The compiled graph uses a SQLite-backed checkpointer. The API supplies the session ID as `thread_id`, allowing LangGraph to associate state with the same conversation across requests. The final response is then cached by the API and returned to the frontend.
+
+**Relevant modules:** `src/api/app.py`, `src/agents/agent_graph.py`, `src/retrieval/intent_detector.py`, `src/retrieval/hybrid_retriever.py`, and `src/llm/prompt_builder.py`.
 
 ### 7. Prompt construction and LLM response
 
