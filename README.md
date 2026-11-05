@@ -150,6 +150,381 @@ flowchart TD
 
 **Relevant modules:** `src/ingestion/discovery.py`, `src/ingestion/automatic_indexer.py`, and `src/ingestion/parser.py`.
 
+#### The three ingestion components and their responsibilities
+
+The ingestion implementation is split across three cooperating files. They are not three sequential file formats or three separate stages of extraction; each file owns a distinct responsibility:
+
+| File | Responsibility | Main class / function |
+|---|---|---|
+| `discovery.py` | Find files, detect filesystem changes, identify duplicates, and enqueue work | `DocumentDiscoveryModule`, `DiscoveryEventHandler`, `compute_sha256()` |
+| `parser.py` | Read PDF/DOCX contents and return a structured parsed-document object | `DocumentParserModule`, `PDFParser`, `DOCXParser` |
+| `automatic_indexer.py` | Consume queued events and coordinate parsing, metadata extraction, chunking, embedding, and storage | `AutomaticIndexingModule` |
+
+```mermaid
+flowchart TB
+    F["PDF / DOCX files"] --> D["discovery.py<br/>Find and monitor files"]
+    D --> REG[("SQLite document registry")]
+    D --> Q[["PipelineEvent queue"]]
+    Q --> W["automatic_indexer.py<br/>Background worker"]
+    W --> P["parser.py<br/>Extract document content"]
+    P --> M["Metadata extraction"]
+    P --> C["Semantic chunking"]
+    M --> SQL[("SQLite metadata")]
+    C --> E["Embedding pipeline"]
+    E --> V[("ChromaDB vectors + chunks")]
+    W --> STATUS["Update indexed / failed status"]
+    STATUS --> REG
+```
+
+#### A. `discovery.py` — finding and monitoring documents
+
+**1. Supported-file filtering**
+
+The discovery module watches a configured directory recursively and accepts only PDF and DOCX files. The extension check is centralized in `is_supported_file()`:
+
+```python
+def is_supported_file(self, file_path: str) -> bool:
+    _, ext = os.path.splitext(file_path.lower())
+    return ext in {".pdf", ".docx"}
+```
+
+**2. Startup scan plus continuous monitoring**
+
+When `start()` is called, the module first performs a full scan with `force_rescan()`. It then starts a Watchdog observer, so files added or changed after startup are also detected.
+
+```python
+def start(self):
+    self.force_rescan()  # Reconcile folder contents with SQLite
+
+    self.observer = Observer()
+    handler = DiscoveryEventHandler(self)
+    self.observer.schedule(
+        handler,
+        path=self.watched_dir,
+        recursive=True
+    )
+    self.observer.start()
+```
+
+The startup scan is important: filesystem events only report changes observed while the watcher is running. A full scan also finds files that were already present before the application started.
+
+**3. Duplicate detection using SHA-256**
+
+The implementation hashes file bytes in 64 KB blocks. This avoids loading an entire large document into memory just to calculate its content fingerprint.
+
+```python
+def compute_sha256(file_path: str) -> str:
+    hasher = hashlib.sha256()
+
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hasher.update(chunk)
+
+    return hasher.hexdigest()
+```
+
+During a scan, the module checks both the file path and content hash:
+
+- If the path is already registered and its hash changed, it queues a **modified** event.
+- If the path is new but the same hash already exists for another registered document, it skips the duplicate.
+- If neither the path nor hash exists, it creates a document record with status `pending` and queues a **new** event.
+
+This distinguishes a file being renamed/copied from genuinely new document content.
+
+**4. Debouncing filesystem events**
+
+Some applications emit several modification events while one file is being saved. `FileDebouncer` suppresses repeated events of the same type for the same path within a 0.3-second window:
+
+```python
+def should_process(self, path: str, event_type: str) -> bool:
+    now = time.time()
+    key = (path, event_type)
+
+    if now - self.last_events.get(key, 0.0) < self.window:
+        return False
+
+    self.last_events[key] = now
+    return True
+```
+
+The Watchdog handler uses this check before forwarding created, modified, deleted, or moved-file events to the discovery module.
+
+**5. Converting a filesystem change into a pipeline event**
+
+Discovery does not parse a document itself. It creates a `PipelineEvent` and puts it on a thread-safe queue. The event contains an event ID, event type, document ID, path, extension, and timestamp.
+
+```python
+def _emit_event(self, event_type, doc_id, file_path):
+    _, ext = os.path.splitext(file_path.lower())
+
+    event = PipelineEvent(
+        event_id=str(uuid.uuid4()),
+        event_type=event_type,
+        doc_id=doc_id,
+        file_path=file_path,
+        file_extension=ext,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    self.event_queue.put(event)
+```
+
+**Discovery lifecycle**
+
+```mermaid
+flowchart TD
+    START(["Application starts"]) --> SCAN["force_rescan()"]
+    SCAN --> WALK["Walk watched directory recursively"]
+    WALK --> EXT{"PDF or DOCX?"}
+    EXT -->|No| SKIP["Ignore file"]
+    EXT -->|Yes| SIZE["Check file size"]
+    SIZE --> HASH["Calculate SHA-256"]
+    HASH --> PATH{"Path already registered?"}
+    PATH -->|Yes| CHANGED{"Hash changed or status needs retry?"}
+    CHANGED -->|Yes| MOD["Set pending and enqueue modified"]
+    CHANGED -->|No| DONE["No action"]
+    PATH -->|No| DUP{"Hash already registered?"}
+    DUP -->|Yes| SKIPD["Skip duplicate content"]
+    DUP -->|No| NEW["Create pending record and enqueue new"]
+    MOD --> QUEUE[["PipelineEvent queue"]]
+    NEW --> QUEUE
+    SCAN --> WATCH["Start Watchdog observer"]
+    WATCH --> EVENTS["Created / modified / deleted / moved"]
+    EVENTS --> DEBOUNCE["Debounce repeated events"]
+    DEBOUNCE --> QUEUE
+```
+
+#### B. `parser.py` — extracting readable document content
+
+The parser converts a file on disk into a `ParsedDocument`. The rest of the pipeline consumes this common structure rather than needing to know whether the source was a PDF or DOCX.
+
+**1. Format dispatch**
+
+`DocumentParserModule` checks the file extension and delegates to the corresponding parser:
+
+```python
+def parse_document(self, file_path: str, doc_id: str) -> ParsedDocument:
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(file_path)
+
+    _, ext = os.path.splitext(file_path.lower())
+
+    if ext == ".pdf":
+        return self.pdf_parser.parse(file_path, doc_id)
+    elif ext == ".docx":
+        return self.docx_parser.parse(file_path, doc_id)
+
+    raise ValueError(f"Unsupported file format: {ext}")
+```
+
+**2. PDF parsing: native text first, OCR when needed**
+
+The PDF parser uses PyMuPDF (`fitz`). It checks each page for a usable native text layer. If the page contains enough readable text, it extracts text blocks and tables. If the page appears scanned or image-only, it attempts OCR using PyMuPDF's Tesseract bridge.
+
+```python
+raw_native = page.get_text("text")
+clean_native = _strip_watermark(raw_native)
+has_real_text = len(clean_native.strip()) > 40
+
+if has_real_text:
+    # Extract native text, tables, blocks and heading information
+    ...
+else:
+    # Scanned/image page: use OCR
+    ocr_text = _ocr_page(page)
+    ocr_text = _strip_watermark(ocr_text)
+```
+
+The parser also:
+- Detects likely headings using font-size statistics and bold formatting.
+- Extracts tables into headers, rows, and raw text.
+- Removes repeated watermark/footer noise.
+- Normalizes Unicode, whitespace, bullets, line endings, and words split by line-ending hyphens.
+- Raises specific errors for protected, corrupted, scanned-without-readable-text, or empty documents.
+
+> **OCR requirement:** the code calls PyMuPDF's `get_textpage_ocr()`, which relies on Tesseract being available to the runtime. OCR may fail if the required Tesseract installation or language data is missing.
+
+**3. DOCX parsing: preserve paragraph and table order**
+
+The DOCX parser uses `python-docx`. It walks the document body in order, handling paragraphs and tables as they appear. Paragraph styles beginning with `Heading` are used to identify section headings. Tables are converted into headers, rows, and plain-text representations so their contents are also searchable downstream.
+
+```python
+for child in doc.element.body:
+    if child.tag.endswith("p"):
+        body_elements.append(Paragraph(child, doc))
+    elif child.tag.endswith("tbl"):
+        body_elements.append(Table(child, doc))
+
+for element in body_elements:
+    if isinstance(element, Paragraph):
+        text = element.text
+        # Capture paragraph text and heading sections
+        ...
+    elif isinstance(element, Table):
+        # Extract each row and cell
+        ...
+```
+
+**4. Common parsed output**
+
+Both parsers return a `ParsedDocument` containing fields such as:
+
+| Field | Meaning |
+|---|---|
+| `doc_id` | Stable registry ID for the source document |
+| `file_path` / `file_type` | Source location and format |
+| `full_text` | Normalized full document text |
+| `pages` | Page-level content and text blocks (PDF) |
+| `sections` | Heading-based sections and their content |
+| `tables` | Extracted table headers, rows, and raw text |
+| `document_title` | Title from PDF/DOCX metadata when available |
+| `page_count` | PDF page count; DOCX currently reports 0 |
+| `char_count` | Number of characters in normalized text |
+
+The common data model is defined in `src/ingestion/models.py` (`ParsedDocument`, `ParsedPage`, `ParsedSection`, `ParsedTable`, and `TextBlock`).
+
+```mermaid
+flowchart TD
+    FILE["Source file"] --> DISPATCH{"File extension"}
+    DISPATCH -->|.pdf| PDF["PDFParser / PyMuPDF"]
+    DISPATCH -->|.docx| DOCX["DOCXParser / python-docx"]
+    PDF --> NATIVE{"Readable native text?"}
+    NATIVE -->|Yes| TEXT["Extract text, tables, blocks"]
+    NATIVE -->|No| OCR["OCR page with Tesseract bridge"]
+    OCR --> TEXT
+    DOCX --> ORDER["Read paragraphs and tables in body order"]
+    ORDER --> TEXT
+    TEXT --> NORMALIZE["Normalize and validate text"]
+    NORMALIZE --> MODEL["ParsedDocument"]
+```
+
+#### C. `automatic_indexer.py` — processing events in the background
+
+The automatic indexer is the consumer of the queue populated by discovery. It owns a background worker thread and coordinates the document-processing components.
+
+**1. Start the worker thread**
+
+```python
+def start(self):
+    if self.is_running:
+        return
+
+    self.is_running = True
+    self._stop_event.clear()
+
+    self.worker_thread = threading.Thread(
+        target=self._worker_loop,
+        name="IndexingWorker",
+        daemon=True
+    )
+    self.worker_thread.start()
+```
+
+The worker waits for a `PipelineEvent`, processes it, and marks the queue task complete. It continues until the stop event is set.
+
+```python
+def _worker_loop(self):
+    while not self._stop_event.is_set():
+        try:
+            event = self.event_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        try:
+            self._process_event(event)
+        finally:
+            self.event_queue.task_done()
+```
+
+**2. Handle new, modified, and deleted events**
+
+For a deleted file, the indexer removes its ChromaDB chunks and SQLite metadata, then marks the registry entry as deleted.
+
+For a new or modified file, the indexer runs the full indexing pipeline. A modified document is cleaned up first so old chunks and metadata are not left alongside the new version.
+
+```python
+if event.event_type == "deleted":
+    self.chroma_manager.delete_document_chunks(event.doc_id)
+    meta_repo.delete_metadata(event.doc_id)
+    doc_repo.update_document_status(event.doc_id, "deleted")
+    session.commit()
+
+elif event.event_type in ["new", "modified"]:
+    if event.event_type == "modified":
+        self.chroma_manager.delete_document_chunks(event.doc_id)
+        meta_repo.delete_metadata(event.doc_id)
+
+    doc_repo.update_document_status(event.doc_id, "indexing")
+    session.commit()
+
+    parsed_doc = self.parser_module.parse_document(
+        event.file_path, event.doc_id
+    )
+    metadata_dict, report = self.metadata_extractor.extract_metadata(parsed_doc)
+    meta_repo.insert_metadata(event.doc_id, metadata_dict)
+    chunks = self.chunker.chunk_document(parsed_doc, metadata_dict)
+    embedded_chunks = self.embedding_pipeline.embed_chunks(chunks)
+    self.chroma_manager.upsert_chunks(embedded_chunks)
+
+    doc_repo.update_document_status(event.doc_id, "indexed", indexed_at=now_str)
+    session.commit()
+```
+
+**3. The complete indexing sequence**
+
+```mermaid
+sequenceDiagram
+    participant D as DocumentDiscoveryModule
+    participant Q as Event queue
+    participant I as AutomaticIndexingModule
+    participant P as DocumentParserModule
+    participant M as MetadataExtractorModule
+    participant C as SemanticChunkerModule
+    participant E as EmbeddingPipelineModule
+    participant V as ChromaManager
+    participant DB as SQLite repositories
+
+    D->>DB: Insert/update document registry record
+    D->>Q: Enqueue PipelineEvent
+    I->>Q: Get next event
+    I->>DB: Set status = indexing
+    I->>P: parse_document(path, doc_id)
+    P-->>I: ParsedDocument
+    I->>M: extract_metadata(parsed_doc)
+    M-->>I: metadata dictionary + report
+    I->>DB: Insert structured metadata
+    I->>C: chunk_document(parsed_doc, metadata)
+    C-->>I: Text chunks
+    I->>E: embed_chunks(chunks)
+    E-->>I: Embedded chunks
+    I->>V: upsert_chunks(embedded_chunks)
+    I->>DB: Set status = indexed
+```
+
+**4. Failure handling and cache invalidation**
+
+If an indexing step raises an exception, the indexer rolls back the current database transaction where possible and attempts to set the document status to `failed`, recording the failure reason. After successful indexing or deletion, it clears the query and analytics caches when those caches are configured.
+
+The status information exposed by `get_status()` includes whether the worker is running, queue depth, current file, indexed and failed counts, and the last successful indexing timestamp.
+
+#### Putting the three files together
+
+A useful way to remember the separation of concerns is:
+
+- **Discovery asks:** “What changed in the watched folder?”
+- **Parser asks:** “What information can I read from this file?”
+- **Automatic indexer asks:** “What should the system do with this parsed document so it becomes searchable?”
+
+```mermaid
+flowchart LR
+    A["discovery.py<br/>Detect + identify change"] -->|PipelineEvent| B[["Queue"]]
+    B --> C["automatic_indexer.py<br/>Orchestrate processing"]
+    C -->|file path + doc ID| D["parser.py<br/>PDF / DOCX → ParsedDocument"]
+    D --> C
+    C --> E["Metadata + chunks + embeddings"]
+    E --> F[("SQLite + ChromaDB")]
+```
+
 ### 2. Metadata extraction
 
 Metadata extraction converts unstructured job-description text into structured fields that can be filtered and compared. The extraction package separates the orchestration logic from individual extraction strategies.
