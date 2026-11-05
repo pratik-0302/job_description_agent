@@ -33,59 +33,96 @@ The application combines:
 
 ## Architecture
 
-```text
-                  JOB DESCRIPTION FILES
-                       PDF / DOCX
-                           |
-                           v
-                   Document Discovery
-                           |
-                           v
-                    Document Parser
-                           |
-              +------------+-------------+
-              |                          |
-              v                          v
-       Metadata Extraction         Raw Document Text
-       Rules -> NLP -> LLM                |
-              |                          v
-              v                    Semantic Chunking
-        SQLite Storage                    |
-                                         v
-                                  BGE Embeddings
-                                         |
-                                         v
-                                     ChromaDB
+The system has two main paths: an **offline indexing pipeline** that prepares job descriptions, and an **online query pipeline** that retrieves evidence and generates answers.
 
+### High-level system architecture
 
- User Query
-     |
-     v
- FastAPI
-     |
-     v
- Intent / Entity Processing
-     |
-     v
- Hybrid Retrieval
-   /          \
-  v            v
-SQLite      ChromaDB
-  \            /
-   v          v
-    Reciprocal Rank Fusion
-             |
-             v
-       LangGraph Workflow
-             |
-             v
-       Prompt Construction
-             |
-             v
-       Ollama (Local LLM)
-             |
-             v
-        Final Response
+```mermaid
+flowchart TB
+    subgraph OFFLINE["Offline: document indexing"]
+        A["Job descriptions<br/>PDF / DOCX"] --> B["Discovery & parsing"]
+        B --> C["Extracted text"]
+        C --> D["Metadata extraction<br/>Rules → NLP → LLM"]
+        C --> E["Semantic chunking"]
+        D --> F[("SQLite<br/>Structured metadata")]
+        E --> G["BGE embedding model"]
+        G --> H[("ChromaDB<br/>Vectors + chunks")]
+    end
+
+    subgraph ONLINE["Online: question answering"]
+        Q["User question"] --> API["FastAPI"]
+        API --> I["Intent detection"]
+        I --> R["Hybrid retrieval"]
+        F --> R
+        H --> R
+        R --> RR["Reciprocal Rank Fusion"]
+        RR --> LG["LangGraph workflow"]
+        LG --> P["Prompt builder"]
+        P --> L["Ollama / Llama 3.2"]
+        L --> OUT["Grounded response"]
+    end
+
+    style OFFLINE fill:#eef5ff,stroke:#4778b8,color:#172b4d
+    style ONLINE fill:#effaf3,stroke:#3b8b62,color:#173b29
+```
+
+### Offline indexing pipeline
+
+```mermaid
+flowchart TD
+    A["Input folder"] --> B["Discover PDF / DOCX"]
+    B --> C["Parse document text"]
+    C --> D{"Already indexed?<br/>Content hash"}
+    D -- Yes --> E["Skip duplicate"]
+    D -- No --> F["Extract metadata"]
+    F --> G["Rule-based extraction"]
+    G --> H["NLP extraction"]
+    H --> I["LLM extraction<br/>for difficult fields"]
+    I --> J["Validate metadata"]
+    J --> K[("SQLite")]
+    C --> L["Semantic chunking<br/>size + overlap"]
+    L --> M["BGE embeddings"]
+    M --> N[("ChromaDB")]
+```
+
+### Online query and retrieval pipeline
+
+```mermaid
+flowchart TD
+    A["User asks a question"] --> B["FastAPI endpoint"]
+    B --> C["Intent detection<br/>SEARCH / COMPARE / RECOMMEND / ANALYTICS"]
+    C --> D["Build retrieval plan"]
+    D --> E["Structured search"]
+    D --> F["Semantic search"]
+    E --> G["Ranked SQL results"]
+    F --> H["Ranked vector results"]
+    G --> I["Reciprocal Rank Fusion"]
+    H --> I
+    I --> J["Top relevant documents / chunks"]
+    J --> K["LangGraph workflow"]
+    K --> L["Build prompt with retrieved context"]
+    L --> M["Ollama local LLM"]
+    M --> N["Answer to user"]
+```
+
+### LangGraph query workflow
+
+The graph coordinates the steps and passes shared state between nodes. The exact routing can vary with the detected intent and implementation.
+
+```mermaid
+flowchart TD
+    START(["START"]) --> Q["Understand query"]
+    Q --> INTENT["Detect intent"]
+    INTENT --> PLAN["Select retrieval strategy"]
+    PLAN --> RET["Retrieve from SQLite + ChromaDB"]
+    RET --> FUSE["Fuse and rank results"]
+    FUSE --> CHECK{"Enough relevant context?"}
+    CHECK -- Yes --> PROMPT["Construct grounded prompt"]
+    CHECK -- No --> REFINE["Refine / broaden retrieval"]
+    REFINE --> RET
+    PROMPT --> LLM["Call Ollama"]
+    LLM --> VALIDATE["Format response"]
+    VALIDATE --> END(["END"])
 ```
 
 ## Technology Stack
@@ -173,6 +210,27 @@ Structured retrieval is useful for exact constraints (for example, branch or CGP
 ```text
 RRF(d) = sum over rankings r of 1 / (k + rank_r(d))
 ```
+
+### How hybrid retrieval works
+
+The structured and semantic retrievers solve different parts of the same question. For example, a branch-eligibility filter is better handled by SQLite, while a question such as “find roles involving building AI agents” benefits from semantic similarity search.
+
+```mermaid
+flowchart LR
+    Q["Placement query"] --> S["Structured retriever"]
+    Q --> V["Vector retriever"]
+    S --> SR["SQL-ranked candidates"]
+    V --> VR["Similarity-ranked chunks"]
+    SR --> RRF["Reciprocal Rank Fusion"]
+    VR --> RRF
+    RRF --> TOP["Merged ranked results"]
+```
+
+RRF gives each result a score based on its position in each ranking:
+
+`RRF(d) = Σ 1 / (k + rank(d))`
+
+A document ranked highly by multiple retrievers receives a stronger combined score. This avoids directly comparing SQL scores with vector similarity scores, which may use different scales.
 
 ### 6. Agent workflow and response generation
 
