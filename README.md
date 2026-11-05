@@ -473,32 +473,61 @@ elif event.event_type in ["new", "modified"]:
 **3. The complete indexing sequence**
 
 ```mermaid
-sequenceDiagram
-    participant D as DocumentDiscoveryModule
-    participant Q as Event queue
-    participant I as AutomaticIndexingModule
-    participant P as DocumentParserModule
-    participant M as MetadataExtractorModule
-    participant C as SemanticChunkerModule
-    participant E as EmbeddingPipelineModule
-    participant V as ChromaManager
-    participant DB as SQLite repositories
+flowchart TB
+    subgraph DISCOVERY["1. DISCOVER DOCUMENTS"]
+        START(["Application starts"]) --> SCAN["force_rescan()<br/>Scan folder and reconcile registry"]
+        SCAN --> WATCH["Start Watchdog observer"]
+        WATCH --> FS["Filesystem change<br/>created / modified / deleted"]
+        FS --> DEBOUNCE["Debounce repeated events"]
+        DEBOUNCE --> CHECK["Validate file and check SHA-256"]
+        CHECK --> EVENT["Create PipelineEvent"]
+        SCAN -->|New or changed files| EVENT
+    end
 
-    D->>DB: Insert/update document registry record
-    D->>Q: Enqueue PipelineEvent
-    I->>Q: Get next event
-    I->>DB: Set status = indexing
-    I->>P: parse_document(path, doc_id)
-    P-->>I: ParsedDocument
-    I->>M: extract_metadata(parsed_doc)
-    M-->>I: metadata dictionary + report
-    I->>DB: Insert structured metadata
-    I->>C: chunk_document(parsed_doc, metadata)
-    C-->>I: Text chunks
-    I->>E: embed_chunks(chunks)
-    E-->>I: Embedded chunks
-    I->>V: upsert_chunks(embedded_chunks)
-    I->>DB: Set status = indexed
+    subgraph QUEUE["2. HAND OFF WORK"]
+        EVENT --> Q[["Thread-safe event queue"]]
+        Q --> WORKER["AutomaticIndexingModule<br/>worker gets next event"]
+        WORKER --> TYPE{"Event type?"}
+    end
+
+    subgraph PROCESS["3. PROCESS DOCUMENT"]
+        TYPE -->|New or modified| STATUS["Set document status: indexing"]
+        STATUS --> PARSE["DocumentParserModule<br/>PDF / DOCX → ParsedDocument"]
+        PARSE --> META["MetadataExtractorModule<br/>Extract company, role, skills, etc."]
+        PARSE --> CHUNK["SemanticChunkerModule<br/>Split text into chunks"]
+        META --> SQLMETA[("SQLite<br/>structured metadata")]
+        META --> CHUNK
+        CHUNK --> EMBED["EmbeddingPipelineModule<br/>Convert chunks into vectors"]
+        EMBED --> UPSERT["ChromaManager<br/>Upsert chunks + vectors"]
+        UPSERT --> DONE["Set document status: indexed"]
+        TYPE -->|Deleted| CLEAN["Delete document chunks<br/>and structured metadata"]
+        CLEAN --> DELETED["Set document status: deleted"]
+    end
+
+    subgraph STORAGE["4. PERSISTENCE"]
+        REG[("SQLite<br/>document registry")]
+        SQLMETA
+        VDB[("ChromaDB<br/>vectors + chunk text")]
+    end
+
+    SCAN -.-> REG
+    CHECK -.-> REG
+    EVENT -.-> REG
+    CLEAN --> VDB
+    CLEAN --> SQLMETA
+    UPSERT --> VDB
+    DONE --> REG
+    DELETED --> REG
+
+    classDef discovery fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef queue fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef worker fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef processing fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef storage fill:#cffafe,stroke:#0891b2,color:#164e63
+    class START,SCAN,WATCH,FS,DEBOUNCE,CHECK,EVENT discovery
+    class Q,WORKER,TYPE queue
+    class STATUS,PARSE,META,CHUNK,EMBED,UPSERT,DONE,CLEAN,DELETED processing
+    class REG,SQLMETA,VDB storage
 ```
 
 **4. Failure handling and cache invalidation**
