@@ -717,33 +717,52 @@ Examples of useful metadata include company name, role title, job type, package/
 
 ```mermaid
 flowchart TB
-    subgraph EXTRACT["1. EXTRACT METADATA IN STAGES"]
-        TEXT["Parsed job-description text"] --> MODULE["MetadataExtractor"]
-        MODULE --> RULES["Rule extractor<br/>Regex + known patterns"]
-        RULES --> NLP["NLP extractor<br/>Entities + phrases"]
-        NLP --> LLM["LLM extractor<br/>Context-dependent fields"]
+    subgraph INPUT["1. INPUT — parsed job description"]
+        DOC["ParsedDocument<br/>full_text + document ID"] --> ORCH["MetadataExtractorModule<br/>coordinates extraction"]
     end
 
-    subgraph VALIDATE["2. NORMALIZE AND VALIDATE"]
-        LLM --> NORMALIZE["Normalize field names<br/>and values"]
-        NORMALIZE --> VALIDATE{"Required fields<br/>and values valid?"}
-        VALIDATE -->|Yes| MODEL["Structured metadata object"]
-        VALIDATE -->|No| REPORT["Keep missing / uncertain fields<br/>in extraction report"]
-        REPORT --> MODEL
+    subgraph RULES["2. RULE-BASED EXTRACTION — exact patterns"]
+        ORCH --> REGEX["RuleBasedExtractor<br/>Regex + deterministic patterns"]
+        REGEX --> R_FIELDS["Company • role • CGPA<br/>CTC • stipend • duration • deadline"]
     end
 
-    subgraph STORE["3. PERSIST STRUCTURED DATA"]
-        MODEL --> SQLITE[("SQLite<br/>document metadata")]
+    subgraph NLP["3. NLP-BASED EXTRACTION — enrich partial results"]
+        R_FIELDS --> NLP_MOD["NLPExtractor<br/>Known skills, branch mappings,<br/>locations + experience patterns"]
+        NLP_MOD --> PARTIAL["PartialMetadata<br/>values + per-field confidence scores"]
     end
 
-    classDef source fill:#dbeafe,stroke:#2563eb,color:#172554
-    classDef extract fill:#ffedd5,stroke:#ea580c,color:#7c2d12
-    classDef validate fill:#ede9fe,stroke:#7c3aed,color:#3b0764
-    classDef store fill:#cffafe,stroke:#0891b2,color:#164e63
-    class TEXT source
-    class MODULE,RULES,NLP,LLM extract
-    class NORMALIZE,VALIDATE,MODEL,REPORT validate
-    class SQLITE store
+    subgraph DECISION["4. CONFIDENCE CHECK — decide whether LLM is needed"]
+        PARTIAL --> CHECK["Check core fields<br/>missing or confidence below 0.70"]
+        CHECK --> CONTEXT{"Field relevant to<br/>job type?"}
+        CONTEXT -->|No — e.g. stipend for FTE| SKIP["Skip irrelevant field"]
+        CONTEXT -->|Yes| MISSING{"Any core fields<br/>still missing / low confidence?"}
+        MISSING -->|No| NORMALIZE
+        MISSING -->|Yes| LLM["LLMExtractor — local Ollama<br/>request only missing fields"]
+        LLM --> MERGE["Merge extracted values<br/>into PartialMetadata"]
+        MERGE --> NORMALIZE["Normalize and validate values"]
+    end
+
+    subgraph OUTPUT["5. OUTPUT — structured result + extraction report"]
+        NORMALIZE --> VALID["Validate values<br/>e.g. CGPA between 0 and 10"]
+        VALID --> DATA["Normalized metadata dictionary"]
+        VALID --> REPORT["ExtractionReport<br/>field confidence • source strategy<br/>missing fields • LLM called • duration"]
+        DATA --> SQLITE[("SQLite<br/>structured job metadata")]
+    end
+
+    SKIP --> MISSING
+
+    classDef input fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef rules fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef nlp fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef decision fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef llm fill:#fce7f3,stroke:#db2777,color:#831843
+    classDef output fill:#cffafe,stroke:#0891b2,color:#164e63
+    class DOC,ORCH input
+    class REGEX,R_FIELDS rules
+    class NLP_MOD,PARTIAL nlp
+    class CHECK,CONTEXT,SKIP,MISSING decision
+    class LLM,MERGE llm
+    class NORMALIZE,VALID,DATA,REPORT,SQLITE output
 ```
 
 **Relevant modules:** `src/extraction/metadata_extractor.py`, `rule_extractor.py`, `nlp_extractor.py`, `llm_extractor.py`, and `models.py`.
