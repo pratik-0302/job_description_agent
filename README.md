@@ -72,32 +72,46 @@ The application has an indexing path and a question-answering path. The indexing
 
 ```mermaid
 flowchart TB
-    subgraph INDEX["Indexing path — background processing"]
-        FILES["Job descriptions<br/>PDF / DOCX"] --> WATCH["Discovery / file monitoring"]
-        WATCH --> QUEUE["Event queue"]
-        QUEUE --> PARSE["Document parser"]
-        PARSE --> EXTRACT["Metadata extraction"]
-        PARSE --> CHUNK["Semantic chunking"]
-        EXTRACT --> SQL[("SQLite<br/>documents + metadata")]
+    subgraph INGEST["1. OFFLINE INGESTION — prepare the knowledge base"]
+        FILES["Job descriptions<br/>PDF / DOCX"] --> DISC["Discovery + Watchdog"]
+        DISC --> QUEUE[["Pipeline event queue"]]
+        QUEUE --> INDEX["Background indexing worker"]
+        INDEX --> PARSE["Parse document"]
+        PARSE --> META["Extract structured metadata"]
+        PARSE --> CHUNK["Create semantic chunks"]
+        META --> SQL[("SQLite<br/>documents + metadata")]
         CHUNK --> EMBED["BGE embedding model"]
-        EMBED --> CHROMA[("ChromaDB<br/>vectors + chunks")]
+        EMBED --> VDB[("ChromaDB<br/>chunks + vectors")]
     end
 
-    subgraph QUERY["Question-answering path"]
-        USER["Student question"] --> UI["Streamlit or React UI"]
+    subgraph QUERY["2. ONLINE QUERY — answer a student's question"]
+        USER["Student question"] --> UI["Streamlit / React UI"]
         UI --> API["FastAPI"]
-        API --> CACHE["Query cache"]
-        CACHE --> GRAPH["LangGraph workflow"]
-        GRAPH --> RETRIEVE["Hybrid retrieval"]
-        SQL --> RETRIEVE
-        CHROMA --> RETRIEVE
-        RETRIEVE --> FUSION["RRF result fusion"]
-        FUSION --> CONTEXT["Relevant context"]
+        API --> CACHE{"Query cache hit?"}
+        CACHE -->|Yes| CACHED["Return cached result"]
+        CACHE -->|No| GRAPH["LangGraph workflow"]
+        GRAPH --> RET["Hybrid retrieval"]
+        SQL --> RET
+        VDB --> RET
+        RET --> FUSION["Reciprocal Rank Fusion"]
+        FUSION --> CONTEXT["Relevant context + sources"]
         CONTEXT --> PROMPT["Prompt builder"]
-        PROMPT --> OLLAMA["Ollama / Llama 3.2"]
-        OLLAMA --> ANSWER["Response + source documents"]
+        PROMPT --> LLM["Ollama / Llama 3.2"]
+        LLM --> ANSWER["Generated answer"]
         ANSWER --> UI
+        CACHED --> UI
     end
+
+    classDef input fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef process fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef orchestration fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef storage fill:#cffafe,stroke:#0891b2,color:#164e63
+    classDef output fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class FILES,USER,UI input
+    class DISC,PARSE,META,CHUNK,EMBED,RET,FUSION,PROMPT process
+    class QUEUE,INDEX,API,CACHE,GRAPH orchestration
+    class SQL,VDB storage
+    class CACHED,CONTEXT,LLM,ANSWER output
 ```
 
 ### Main data flow
@@ -130,22 +144,41 @@ The indexing worker handles three important event types:
 A document's status is tracked through the indexing lifecycle, including states such as indexing, indexed, deleted, and failed.
 
 ```mermaid
-flowchart TD
-    A["Configured JD folder"] --> B["Discovery module"]
-    B --> C{"File event"}
-    C -->|New| D["Queue: new"]
-    C -->|Modified| E["Queue: modified"]
-    C -->|Deleted| F["Queue: deleted"]
-    D --> G["Background indexing worker"]
-    E --> G
-    F --> G
-    G --> H{"Event type"}
-    H -->|New| I["Parse and index"]
-    H -->|Modified| J["Delete old index<br/>then re-index"]
-    H -->|Deleted| K["Delete vectors + metadata"]
-    I --> L["Update document status"]
-    J --> L
-    K --> L
+flowchart TB
+    subgraph DETECT["1. DETECT FILESYSTEM CHANGE"]
+        FOLDER["Configured JD folder"] --> DISC["Discovery module"]
+        DISC --> EVENT{"What happened?"}
+    end
+
+    subgraph QUEUE["2. QUEUE THE EVENT"]
+        EVENT -->|Created| NEW[["Queue: new document"]]
+        EVENT -->|Modified| MOD[["Queue: modified document"]]
+        EVENT -->|Deleted| DEL[["Queue: deleted document"]]
+        NEW --> WORKER["Background indexing worker"]
+        MOD --> WORKER
+        DEL --> WORKER
+    end
+
+    subgraph ROUTE["3. HANDLE BY EVENT TYPE"]
+        WORKER --> TYPE{"Event type?"}
+        TYPE -->|New| PARSE["Parse and index document"]
+        TYPE -->|Modified| REPLACE["Remove old index<br/>then re-index"]
+        TYPE -->|Deleted| REMOVE["Delete vectors + metadata"]
+        PARSE --> STATUS["Update document status"]
+        REPLACE --> STATUS
+        REMOVE --> STATUS
+    end
+
+    classDef detect fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef queue fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef process fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef decision fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef finish fill:#cffafe,stroke:#0891b2,color:#164e63
+    class FOLDER,DISC detect
+    class NEW,MOD,DEL queue
+    class PARSE,REPLACE,REMOVE process
+    class EVENT,WORKER,TYPE decision
+    class STATUS finish
 ```
 
 **Relevant modules:** `src/ingestion/discovery.py`, `src/ingestion/automatic_indexer.py`, and `src/ingestion/parser.py`.
@@ -162,18 +195,43 @@ The ingestion implementation is split across three cooperating files. They are n
 
 ```mermaid
 flowchart TB
-    F["PDF / DOCX files"] --> D["discovery.py<br/>Find and monitor files"]
-    D --> REG[("SQLite document registry")]
-    D --> Q[["PipelineEvent queue"]]
-    Q --> W["automatic_indexer.py<br/>Background worker"]
-    W --> P["parser.py<br/>Extract document content"]
-    P --> M["Metadata extraction"]
-    P --> C["Semantic chunking"]
-    M --> SQL[("SQLite metadata")]
-    C --> E["Embedding pipeline"]
-    E --> V[("ChromaDB vectors + chunks")]
-    W --> STATUS["Update indexed / failed status"]
-    STATUS --> REG
+    subgraph DISCOVERY["1. DISCOVERY — find and monitor files"]
+        FILES["PDF / DOCX files"] --> D["discovery.py"]
+        D --> REG[("SQLite document registry")]
+        D --> Q[["PipelineEvent queue"]]
+    end
+
+    subgraph INDEXER["2. INDEXER — coordinate processing"]
+        Q --> W["automatic_indexer.py<br/>Background worker"]
+        W --> P["parser.py<br/>Extract document content"]
+    end
+
+    subgraph TRANSFORM["3. TRANSFORM — prepare searchable data"]
+        P --> M["Metadata extraction"]
+        P --> C["Semantic chunking"]
+        M --> SQL[("SQLite metadata")]
+        C --> E["Embedding pipeline"]
+        E --> V[("ChromaDB<br/>vectors + chunks")]
+    end
+
+    subgraph TRACK["4. TRACK — record outcome"]
+        W --> STATUS{"Processing result?"}
+        STATUS -->|Success| OK["Status: indexed"]
+        STATUS -->|Failure| FAIL["Status: failed"]
+        OK --> REG
+        FAIL --> REG
+    end
+
+    classDef discovery fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef orchestration fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef processing fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef storage fill:#cffafe,stroke:#0891b2,color:#164e63
+    classDef result fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class D,FILES discovery
+    class Q,W,STATUS orchestration
+    class P,M,C,E processing
+    class REG,SQL,V storage
+    class OK,FAIL result
 ```
 
 #### A. `discovery.py` — finding and monitoring documents
@@ -272,26 +330,44 @@ def _emit_event(self, event_type, doc_id, file_path):
 **Discovery lifecycle**
 
 ```mermaid
-flowchart TD
-    START(["Application starts"]) --> SCAN["force_rescan()"]
-    SCAN --> WALK["Walk watched directory recursively"]
-    WALK --> EXT{"PDF or DOCX?"}
-    EXT -->|No| SKIP["Ignore file"]
-    EXT -->|Yes| SIZE["Check file size"]
-    SIZE --> HASH["Calculate SHA-256"]
-    HASH --> PATH{"Path already registered?"}
-    PATH -->|Yes| CHANGED{"Hash changed or status needs retry?"}
-    CHANGED -->|Yes| MOD["Set pending and enqueue modified"]
-    CHANGED -->|No| DONE["No action"]
-    PATH -->|No| DUP{"Hash already registered?"}
-    DUP -->|Yes| SKIPD["Skip duplicate content"]
-    DUP -->|No| NEW["Create pending record and enqueue new"]
-    MOD --> QUEUE[["PipelineEvent queue"]]
-    NEW --> QUEUE
-    SCAN --> WATCH["Start Watchdog observer"]
-    WATCH --> EVENTS["Created / modified / deleted / moved"]
-    EVENTS --> DEBOUNCE["Debounce repeated events"]
-    DEBOUNCE --> QUEUE
+flowchart TB
+    subgraph STARTUP["1. STARTUP RECONCILIATION"]
+        START(["Application starts"]) --> SCAN["force_rescan()"]
+        SCAN --> WALK["Walk watched directory recursively"]
+        WALK --> EXT{"PDF or DOCX?"}
+        EXT -->|No| SKIP["Ignore unsupported file"]
+        EXT -->|Yes| SIZE["Check file size"]
+        SIZE --> HASH["Calculate SHA-256"]
+        HASH --> PATH{"Path already registered?"}
+        PATH -->|Yes| CHANGED{"Hash changed<br/>or retry required?"}
+        CHANGED -->|Yes| MOD["Mark pending<br/>enqueue modified event"]
+        CHANGED -->|No| SAME["No action needed"]
+        PATH -->|No| DUP{"Same content hash<br/>already registered?"}
+        DUP -->|Yes| DUPLICATE["Treat as duplicate"]
+        DUP -->|No| NEW["Create pending record<br/>enqueue new event"]
+    end
+
+    subgraph LIVE["2. LIVE MONITORING"]
+        SCAN --> WATCH["Start Watchdog observer"]
+        WATCH --> EVENTS["Created / modified / deleted / moved"]
+        EVENTS --> DEBOUNCE["Debounce repeated events"]
+        DEBOUNCE --> LIVEQ[["Create and enqueue PipelineEvent"]]
+    end
+
+    MOD --> Q[["PipelineEvent queue"]]
+    NEW --> Q
+    LIVEQ --> Q
+
+    classDef startup fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef monitor fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef decision fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef action fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef queue fill:#cffafe,stroke:#0891b2,color:#164e63
+    class START,SCAN,WALK startup
+    class WATCH,EVENTS,DEBOUNCE monitor
+    class EXT,PATH,CHANGED,DUP decision
+    class SIZE,HASH,MOD,NEW,SKIP,SAME,DUPLICATE action
+    class Q,LIVEQ queue
 ```
 
 #### B. `parser.py` — extracting readable document content
@@ -384,18 +460,39 @@ Both parsers return a `ParsedDocument` containing fields such as:
 The common data model is defined in `src/ingestion/models.py` (`ParsedDocument`, `ParsedPage`, `ParsedSection`, `ParsedTable`, and `TextBlock`).
 
 ```mermaid
-flowchart TD
-    FILE["Source file"] --> DISPATCH{"File extension"}
-    DISPATCH -->|.pdf| PDF["PDFParser / PyMuPDF"]
-    DISPATCH -->|.docx| DOCX["DOCXParser / python-docx"]
-    PDF --> NATIVE{"Readable native text?"}
-    NATIVE -->|Yes| TEXT["Extract text, tables, blocks"]
-    NATIVE -->|No| OCR["OCR page with Tesseract bridge"]
-    OCR --> TEXT
-    DOCX --> ORDER["Read paragraphs and tables in body order"]
-    ORDER --> TEXT
-    TEXT --> NORMALIZE["Normalize and validate text"]
-    NORMALIZE --> MODEL["ParsedDocument"]
+flowchart TB
+    subgraph INPUT["1. IDENTIFY DOCUMENT FORMAT"]
+        FILE["Source file"] --> DISPATCH{"File extension?"}
+        DISPATCH -->|.pdf| PDF["PDFParser<br/>PyMuPDF"]
+        DISPATCH -->|.docx| DOCX["DOCXParser<br/>python-docx"]
+    end
+
+    subgraph PDFPATH["2A. PDF EXTRACTION"]
+        PDF --> NATIVE{"Readable native text?"}
+        NATIVE -->|Yes| PDFTEXT["Extract text, tables<br/>and layout blocks"]
+        NATIVE -->|No / too little text| OCR["OCR fallback<br/>Tesseract bridge"]
+        OCR --> PDFTEXT
+    end
+
+    subgraph DOCXPATH["2B. DOCX EXTRACTION"]
+        DOCX --> ORDER["Read paragraphs and tables<br/>in document-body order"]
+        ORDER --> DOCXTEXT["Extract text and tables"]
+    end
+
+    subgraph OUTPUT["3. NORMALIZE COMMON OUTPUT"]
+        PDFTEXT --> NORMALIZE["Normalize and validate text"]
+        DOCXTEXT --> NORMALIZE
+        NORMALIZE --> MODEL["ParsedDocument"]
+    end
+
+    classDef input fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef parser fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef decision fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef output fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class FILE,DISPATCH input
+    class PDF,DOCX,PDFTEXT,OCR,ORDER,DOCXTEXT parser
+    class NATIVE decision
+    class NORMALIZE,MODEL output
 ```
 
 #### C. `automatic_indexer.py` — processing events in the background
@@ -474,7 +571,7 @@ elif event.event_type in ["new", "modified"]:
 
 ```mermaid
 flowchart TB
-    subgraph DISCOVERY["1. DISCOVER DOCUMENTS"]
+    subgraph DISCOVERY["1. DISCOVERY — detect what changed"]
         START(["Application starts"]) --> SCAN["force_rescan()<br/>Scan folder and reconcile registry"]
         SCAN --> WATCH["Start Watchdog observer"]
         WATCH --> FS["Filesystem change<br/>created / modified / deleted"]
@@ -499,9 +596,9 @@ flowchart TB
         META --> CHUNK
         CHUNK --> EMBED["EmbeddingPipelineModule<br/>Convert chunks into vectors"]
         EMBED --> UPSERT["ChromaManager<br/>Upsert chunks + vectors"]
-        UPSERT --> DONE["Set document status: indexed"]
+        UPSERT --> DONE["Set status: indexed"]
         TYPE -->|Deleted| CLEAN["Delete document chunks<br/>and structured metadata"]
-        CLEAN --> DELETED["Set document status: deleted"]
+        CLEAN --> DELETED["Set status: deleted"]
     end
 
     subgraph STORAGE["4. PERSISTENCE"]
@@ -547,8 +644,7 @@ A useful way to remember the separation of concerns is:
 ```mermaid
 flowchart TB
     subgraph DISCOVERY["1. DISCOVERY — detect what changed"]
-        A["discovery.py<br/>Startup rescan + Watchdog events"]
-        A --> B["Validate file + compare SHA-256"]
+        A["discovery.py<br/>Startup rescan + Watchdog events"] --> B["Validate file + compare SHA-256"]
         B --> C["Create PipelineEvent<br/>created / modified / deleted"]
     end
 
@@ -589,8 +685,7 @@ flowchart TB
     end
 
     subgraph MONITOR["5. STATUS / OBSERVABILITY"]
-        STATUS["get_status()"]
-        STATUS --- DETAILS["Worker running • queue depth<br/>current file • indexed / failed counts<br/>last successful indexing time"]
+        STATUS["get_status()"] --- DETAILS["Worker running • queue depth<br/>current file • indexed / failed counts<br/>last successful indexing time"]
     end
 
     classDef discovery fill:#dbeafe,stroke:#2563eb,color:#172554
@@ -621,14 +716,34 @@ The intended layered strategy is:
 Examples of useful metadata include company name, role title, job type, package/CTC, CGPA cutoff, deadline, locations, eligible branches, and skills.
 
 ```mermaid
-flowchart TD
-    A["Parsed job-description text"] --> B["MetadataExtractor"]
-    B --> C["Rule extractor<br/>patterns / regex"]
-    C --> D["NLP extractor<br/>entities / phrases"]
-    D --> E["LLM extractor<br/>context-dependent fields"]
-    E --> F["Normalize and validate fields"]
-    F --> G["Structured metadata object"]
-    G --> H[("SQLite")]
+flowchart TB
+    subgraph EXTRACT["1. EXTRACT METADATA IN STAGES"]
+        TEXT["Parsed job-description text"] --> MODULE["MetadataExtractor"]
+        MODULE --> RULES["Rule extractor<br/>Regex + known patterns"]
+        RULES --> NLP["NLP extractor<br/>Entities + phrases"]
+        NLP --> LLM["LLM extractor<br/>Context-dependent fields"]
+    end
+
+    subgraph VALIDATE["2. NORMALIZE AND VALIDATE"]
+        LLM --> NORMALIZE["Normalize field names<br/>and values"]
+        NORMALIZE --> VALIDATE{"Required fields<br/>and values valid?"}
+        VALIDATE -->|Yes| MODEL["Structured metadata object"]
+        VALIDATE -->|No| REPORT["Keep missing / uncertain fields<br/>in extraction report"]
+        REPORT --> MODEL
+    end
+
+    subgraph STORE["3. PERSIST STRUCTURED DATA"]
+        MODEL --> SQLITE[("SQLite<br/>document metadata")]
+    end
+
+    classDef source fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef extract fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef validate fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef store fill:#cffafe,stroke:#0891b2,color:#164e63
+    class TEXT source
+    class MODULE,RULES,NLP,LLM extract
+    class NORMALIZE,VALIDATE,MODEL,REPORT validate
+    class SQLITE store
 ```
 
 **Relevant modules:** `src/extraction/metadata_extractor.py`, `rule_extractor.py`, `nlp_extractor.py`, `llm_extractor.py`, and `models.py`.
@@ -647,21 +762,38 @@ The current configuration specifies:
 - Chunk overlap: `60` tokens
 
 ```mermaid
-flowchart LR
-    A["Parsed document"] --> B["Semantic chunker"]
-    B --> C1["Chunk 1"]
-    B --> C2["Chunk 2"]
-    B --> C3["Chunk 3"]
-    C1 --> D["BGE embedding model"]
-    C2 --> D
-    C3 --> D
-    D --> E1["Vector 1"]
-    D --> E2["Vector 2"]
-    D --> E3["Vector 3"]
-    E1 --> F["Store chunk + vector + metadata"]
-    E2 --> F
-    E3 --> F
-    F --> G[("ChromaDB")]
+flowchart TB
+    subgraph CHUNKING["1. SPLIT THE PARSED DOCUMENT"]
+        DOC["Parsed document + metadata"] --> CHUNKER["SemanticChunkerModule"]
+        CHUNKER --> C1["Chunk 1"]
+        CHUNKER --> C2["Chunk 2"]
+        CHUNKER --> C3["Chunk 3"]
+    end
+
+    subgraph EMBEDDING["2. CONVERT EACH CHUNK TO A VECTOR"]
+        C1 --> MODEL["BGE embedding model"]
+        C2 --> MODEL
+        C3 --> MODEL
+        MODEL --> V1["Vector 1"]
+        MODEL --> V2["Vector 2"]
+        MODEL --> V3["Vector 3"]
+    end
+
+    subgraph STORAGE["3. STORE SEARCHABLE RECORDS"]
+        V1 --> RECORD["Pair each vector with<br/>its text + metadata"]
+        V2 --> RECORD
+        V3 --> RECORD
+        RECORD --> DB[("ChromaDB<br/>chunk text + vectors + metadata")]
+    end
+
+    classDef input fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef process fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef vector fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef storage fill:#cffafe,stroke:#0891b2,color:#164e63
+    class DOC,C1,C2,C3 input
+    class CHUNKER,MODEL process
+    class V1,V2,V3 vector
+    class RECORD,DB storage
 ```
 
 At query time, the same embedding model is used to embed the user's question. The vector database can then retrieve chunks that are semantically close to the query.
@@ -685,13 +817,30 @@ For example:
 
 ```mermaid
 flowchart TB
-    DOC["Indexed job description"] --> META["Structured metadata"]
-    DOC --> TEXT["Text chunks"]
-    META --> SQL[("SQLite")]
-    TEXT --> EMBED["Embedding model"]
-    EMBED --> VDB[("ChromaDB")]
-    SQL --> Q1["Exact metadata queries"]
-    VDB --> Q2["Semantic similarity queries"]
+    subgraph PREPARE["1. REPRESENT THE INDEXED DOCUMENT"]
+        DOC["Indexed job description"] --> META["Structured metadata"]
+        DOC --> TEXT["Extracted text chunks"]
+    end
+
+    subgraph STRUCTURED["2A. STRUCTURED STORAGE"]
+        META --> SQL[("SQLite<br/>company, role, skills,<br/>eligibility and document status")]
+        SQL --> FILTER["Exact filters<br/>company / role / skills"]
+    end
+
+    subgraph SEMANTIC["2B. SEMANTIC STORAGE"]
+        TEXT --> EMBED["Embedding model"]
+        EMBED --> VDB[("ChromaDB<br/>vectors + chunk text")]
+        VDB --> SIMILAR["Similarity search<br/>meaning-based matching"]
+    end
+
+    classDef input fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef process fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef structured fill:#cffafe,stroke:#0891b2,color:#164e63
+    classDef semantic fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    class DOC,META,TEXT input
+    class EMBED process
+    class SQL,FILTER structured
+    class VDB,SIMILAR semantic
 ```
 
 **Relevant modules:** `src/storage/sqlite_manager.py` and `src/vector_db/chroma_manager.py`.
@@ -709,17 +858,34 @@ Hybrid retrieval combines structured metadata search with vector similarity sear
 The implementation uses **Reciprocal Rank Fusion (RRF)**. It combines result positions rather than directly comparing raw scores from different retrieval systems.
 
 ```mermaid
-flowchart TD
-    Q["User query"] --> PARSE["Extract entities / filters"]
-    Q --> EMBED["Embed query"]
-    PARSE --> SQL["SQLite metadata search"]
-    EMBED --> CHROMA["ChromaDB similarity search"]
-    SQL --> SQLR["Metadata-ranked results"]
-    CHROMA --> VECR["Vector-ranked chunks"]
-    SQLR --> FUSE["RRF fusion"]
-    VECR --> FUSE
-    FUSE --> RANK["Sort combined results"]
-    RANK --> CONTEXT["Assemble relevant context"]
+flowchart TB
+    subgraph INPUT["1. UNDERSTAND THE USER QUERY"]
+        QUERY["User query"] --> PARSE["Extract entities + filters"]
+        QUERY --> QEMBED["Create query embedding"]
+    end
+
+    subgraph PARALLEL["2. RUN HYBRID RETRIEVAL"]
+        PARSE --> SQL["SQLite metadata search"]
+        QEMBED --> CHROMA["ChromaDB vector search"]
+        SQL --> SQLR["Structured result ranking"]
+        CHROMA --> VECR["Semantic result ranking"]
+    end
+
+    subgraph FUSION["3. COMBINE AND PREPARE RESULTS"]
+        SQLR --> RRF["Reciprocal Rank Fusion<br/>combine ranks from both searches"]
+        VECR --> RRF
+        RRF --> SORT["Sort by fused score"]
+        SORT --> CONTEXT["Assemble relevant chunks<br/>and source documents"]
+    end
+
+    classDef input fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef retrieval fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef fusion fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef output fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class QUERY,PARSE,QEMBED input
+    class SQL,CHROMA,SQLR,VECR retrieval
+    class RRF,SORT fusion
+    class CONTEXT output
 ```
 
 The RRF score for a document is calculated as:
@@ -748,21 +914,38 @@ The intent detector classifies a question into a query category using keyword an
 LangGraph coordinates the workflow using a shared state. Nodes update parts of that state, and graph routing determines which operation should run next. The graph also uses a SQLite-backed checkpointer for conversation/thread persistence.
 
 ```mermaid
-flowchart TD
-    START(["Start"]) --> INTENT["Intent router"]
-    INTENT --> FOLLOW["Resolve follow-up reference"]
-    FOLLOW --> ROUTE{"Detected intent"}
-    ROUTE -->|Search| SEARCH["Search workflow"]
-    ROUTE -->|Compare| COMPARE["Comparison workflow"]
-    ROUTE -->|Recommend| RECOMMEND["Recommendation workflow"]
-    ROUTE -->|Analytics| ANALYTICS["Analytics workflow"]
-    ROUTE -->|Summary| SUMMARY["Summary workflow"]
-    SEARCH --> RESPONSE["Build agent response"]
-    COMPARE --> RESPONSE
-    RECOMMEND --> RESPONSE
-    ANALYTICS --> RESPONSE
-    SUMMARY --> RESPONSE
-    RESPONSE --> END(["End"])
+flowchart TB
+    subgraph ROUTING["1. DETECT USER INTENT"]
+        START(["New user message"]) --> INTENT["Intent router"]
+        INTENT --> FOLLOW["Resolve follow-up reference<br/>when required"]
+        FOLLOW --> ROUTE{"Detected intent"}
+    end
+
+    subgraph WORKFLOWS["2. ROUTE TO THE APPROPRIATE WORKFLOW"]
+        ROUTE -->|Search| SEARCH["Search workflow"]
+        ROUTE -->|Compare| COMPARE["Comparison workflow"]
+        ROUTE -->|Recommend| RECOMMEND["Recommendation workflow"]
+        ROUTE -->|Analytics| ANALYTICS["Analytics workflow"]
+        ROUTE -->|Summary| SUMMARY["Summary workflow"]
+    end
+
+    subgraph RESPONSE["3. BUILD THE RESPONSE"]
+        SEARCH --> BUILD["Build agent response"]
+        COMPARE --> BUILD
+        RECOMMEND --> BUILD
+        ANALYTICS --> BUILD
+        SUMMARY --> BUILD
+        BUILD --> END(["Return response"])
+    end
+
+    classDef input fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef route fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef workflow fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef output fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class START input
+    class INTENT,FOLLOW,ROUTE route
+    class SEARCH,COMPARE,RECOMMEND,ANALYTICS,SUMMARY workflow
+    class BUILD,END output
 ```
 
 The exact operations differ by intent. For example, recommendations can apply student profile filters before semantic ranking, while comparisons collect metadata for the companies mentioned in the question.
@@ -776,20 +959,37 @@ After retrieval, the system assembles relevant document context and passes it to
 The model is configured through `config.yaml`; the current default is `llama3.2:latest` at `http://localhost:11434`, with temperature `0.1` and a timeout of `120` seconds.
 
 ```mermaid
-sequenceDiagram
-    participant G as LangGraph
-    participant R as Retriever
-    participant P as PromptBuilder
-    participant O as Ollama
-    participant U as API/UI
+flowchart TB
+    subgraph RETRIEVAL["1. GATHER EVIDENCE"]
+        GRAPH["LangGraph workflow"] --> RET["Hybrid retriever"]
+        RET --> RESULTS["Ranked documents + chunks"]
+    end
 
-    G->>R: Retrieve evidence for query
-    R-->>G: Ranked documents and chunks
-    G->>P: Query + retrieved context + intent
-    P-->>G: System prompt and user prompt
-    G->>O: Generate response
-    O-->>G: Model response
-    G->>U: Text, sources, confidence, metadata
+    subgraph PROMPT["2. BUILD THE MODEL INPUT"]
+        RESULTS --> BUILDER["PromptBuilder"]
+        BUILDER --> PROMPTS["System prompt + user prompt<br/>with query and retrieved context"]
+    end
+
+    subgraph GENERATION["3. GENERATE THE ANSWER"]
+        PROMPTS --> OLLAMA["Ollama local model"]
+        OLLAMA --> RESPONSE["Generated response"]
+    end
+
+    subgraph DELIVERY["4. RETURN TO USER"]
+        RESPONSE --> API["API / UI"]
+        API --> USER["Answer + sources + metadata"]
+    end
+
+    classDef orchestration fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef retrieval fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef prompt fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef generation fill:#cffafe,stroke:#0891b2,color:#164e63
+    classDef output fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class GRAPH orchestration
+    class RET,RESULTS retrieval
+    class BUILDER,PROMPTS prompt
+    class OLLAMA,RESPONSE generation
+    class API,USER output
 ```
 
 The retrieved evidence is included in the prompt so that the response can be grounded in the indexed job descriptions instead of relying only on the model's general knowledge.
@@ -808,18 +1008,38 @@ The repository contains a FastAPI backend and two frontend implementations:
 The frontend communicates with the backend API. The backend initializes storage, retrieval, the LangGraph agent, caches, and background indexing services during application startup.
 
 ```mermaid
-flowchart LR
-    subgraph FRONTEND["Frontend options"]
-        ST["Streamlit<br/>frontend.py"]
-        REACT["React + Vite<br/>ui/"]
+flowchart TB
+    subgraph CLIENTS["1. USER INTERFACES"]
+        ST["Streamlit UI<br/>frontend.py"]
+        REACT["React + Vite UI<br/>ui/"]
     end
-    ST --> API["FastAPI<br/>src/api/app.py"]
-    REACT --> API
-    API --> GRAPH["LangGraph agent"]
-    API --> DOCS["Document / indexing services"]
-    GRAPH --> RET["Hybrid retrieval"]
-    RET --> DB[("SQLite + ChromaDB")]
-    GRAPH --> LLM["Ollama"]
+
+    subgraph BACKEND["2. APPLICATION BACKEND"]
+        API["FastAPI<br/>src/api/app.py"]
+        GRAPH["LangGraph agent"]
+        DOCS["Document + indexing services"]
+        ST --> API
+        REACT --> API
+        API --> GRAPH
+        API --> DOCS
+    end
+
+    subgraph SERVICES["3. CORE SERVICES"]
+        GRAPH --> RET["Hybrid retrieval"]
+        GRAPH --> LLM["Ollama local LLM"]
+        DOCS --> SQLITE[("SQLite")]
+        RET --> SQLITE
+        RET --> CHROMA[("ChromaDB")]
+    end
+
+    classDef client fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef backend fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef service fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef storage fill:#cffafe,stroke:#0891b2,color:#164e63
+    class ST,REACT client
+    class API,GRAPH,DOCS backend
+    class RET,LLM service
+    class SQLITE,CHROMA storage
 ```
 
 ---
@@ -1073,20 +1293,29 @@ Use the local URL printed by Vite. Ensure the React UI's API configuration point
 ### Application startup sequence
 
 ```mermaid
-sequenceDiagram
-    participant M as main.py
-    participant A as FastAPI
-    participant DB as SQLite / ChromaDB
-    participant G as LangGraph
-    participant W as Discovery + indexing workers
-    participant O as Ollama
+flowchart TB
+    subgraph BOOT["1. APPLICATION STARTUP"]
+        MAIN["main.py"] --> API["Initialize FastAPI application"]
+        API --> DB["Initialize SQLite + ChromaDB"]
+        API --> GRAPH["Build LangGraph + checkpointer"]
+        API --> WORKERS["Start discovery + indexing workers"]
+        API --> CLIENT["Initialize Ollama client"]
+    end
 
-    M->>A: Start application
-    A->>DB: Initialize storage
-    A->>G: Build graph + checkpointer
-    A->>W: Start background workers
-    A->>O: Client initialized for local inference
-    A-->>M: Application ready
+    subgraph READY["2. APPLICATION READY"]
+        DB --> CHECK["Startup components initialized"]
+        GRAPH --> CHECK
+        WORKERS --> CHECK
+        CLIENT --> CHECK
+        CHECK --> READYMSG(["Application ready to serve requests"])
+    end
+
+    classDef startup fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef component fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef ready fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class MAIN,API startup
+    class DB,GRAPH,WORKERS,CLIENT,CHECK component
+    class READYMSG ready
 ```
 
 ---
