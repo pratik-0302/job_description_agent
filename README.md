@@ -819,6 +819,98 @@ At query time, the same embedding model is used to embed the user's question. Th
 
 **Relevant modules:** `src/chunking/semantic_chunker.py` and `src/embedding/embedding_pipeline.py`.
 
+#### What one chunk actually contains
+
+A chunk is not just a piece of text. Your code creates a `TextChunk` object that carries the text together with identifiers and contextual fields. The embedding pipeline converts the `content` into a 384-dimensional vector (the output size of `BAAI/bge-small-en-v1.5`) and creates an `EmbeddedChunk` that retains the chunk's identity and metadata.
+
+For example, a chunk from a Google Software Engineer internship JD might look conceptually like this:
+
+```python
+TextChunk(
+    chunk_id="chunk-uuid-001",
+    doc_id="document-uuid-123",
+    chunk_index=2,
+    chunk_type="text",
+    content="Section: Required Skills\\n\\nCandidates should know Python, C++ and Docker...",
+    token_count=118,
+    section_heading="Required Skills",
+    page_number=2,
+    company_name="Google",
+    role_title="Software Engineer Intern",
+    job_type="internship"
+)
+```
+
+The exact values above are illustrative; IDs are generated at runtime. The fields have these roles:
+
+| Field | What it stores | Why it matters |
+|---|---|---|
+| `chunk_id` | Unique ID for this chunk | Identifies the vector record in ChromaDB |
+| `doc_id` | ID of the source job-description document | Connects multiple chunks to the same JD |
+| `chunk_index` | Position in the document's chunk sequence | Preserves document order |
+| `chunk_type` | `text` or `table` | Distinguishes paragraph-based and table chunks |
+| `content` | Actual chunk text, including section heading prefix when available | Text returned as retrieval evidence |
+| `token_count` | Estimated token count | Helps control chunk size |
+| `section_heading` | Heading associated with the section | Adds context about what the chunk describes |
+| `page_number` | Source page, when available | Helps trace evidence back to the document |
+| `company_name`, `role_title`, `job_type` | Selected document-level metadata | Supports filtering and gives each chunk context |
+
+#### How the chunk, vector, and metadata are stored
+
+The embedding is a numerical representation of the chunk's **content**. It is not a replacement for the text or metadata. ChromaDB stores them together as one record:
+
+- **ID:** `chunk_id`
+- **Document:** the original chunk text (`content`)
+- **Embedding:** a 384-number vector generated from that text
+- **Metadata:** `doc_id`, `chunk_index`, `chunk_type`, `content_hash`, and available fields such as section heading, page, company, role, and job type
+
+A simplified view of one vector is:
+
+```text
+[0.021, -0.114, 0.008, 0.237, ..., -0.041]
+  dim 1   dim 2   dim 3   dim 4       dim 384
+```
+
+Each number is a learned feature from the embedding model. Individual dimensions do not correspond directly to labels such as “Python” or “salary”; the vector represents the overall semantic content.
+
+```mermaid
+flowchart TB
+    subgraph SOURCE["1. SOURCE CHUNK — TextChunk object"]
+        TEXT["content<br/>Section: Required Skills<br/>Python, C++ and Docker..."]
+        FIELDS["chunk_id • doc_id • chunk_index<br/>chunk_type • token_count<br/>section_heading • page_number<br/>company_name • role_title • job_type"]
+    end
+
+    subgraph EMBED["2. EMBEDDING — encode the content"]
+        TEXT --> MODEL["SentenceTransformer<br/>BAAI/bge-small-en-v1.5"]
+        MODEL --> VECTOR["384-dimensional embedding<br/>[0.021, -0.114, 0.008, ..., -0.041]"]
+    end
+
+    subgraph RECORD["3. ONE CHROMADB RECORD"]
+        FIELDS --> ID["ID: chunk_id"]
+        TEXT --> DOCUMENT["Document: original chunk text"]
+        VECTOR --> EMB["Embedding: 384 float values"]
+        FIELDS --> META["Metadata fields<br/>doc_id, chunk_index, chunk_type,<br/>content_hash, heading, page,<br/>company, role, job_type"]
+        ID --> STORE[("ChromaDB collection: jd_chunks")]
+        DOCUMENT --> STORE
+        EMB --> STORE
+        META --> STORE
+    end
+
+    classDef source fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef process fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef vector fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef storage fill:#cffafe,stroke:#0891b2,color:#164e63
+    class TEXT,FIELDS source
+    class MODEL process
+    class VECTOR,EMB vector
+    class ID,DOCUMENT,META,STORE storage
+```
+
+The embedding pipeline also uses a SQLite cache keyed by the SHA-256 hash of the chunk text and the embedding model name. If the same content has already been embedded with the same model, the cached vector can be reused instead of running the model again. The cache is separate from ChromaDB's searchable chunk records.
+
+**Implementation detail:** the chunker estimates tokens using approximately `1.3 × whitespace-separated word count`, rather than a model tokenizer. Although the configuration exposes `chunk_overlap: 60`, the current implementation carries over previous paragraph(s) or sentence fragments when starting the next chunk; it does not enforce an exact 60-token overlap. The README's 60-token value is therefore the configured target, not a guaranteed measured overlap.
+
+
 ### 4. Storage layer
 
 The project uses two storage systems because structured filtering and semantic similarity search are different workloads.
