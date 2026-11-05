@@ -991,6 +991,52 @@ flowchart TB
     class VDB,SIMILAR semantic
 ```
 
+#### What the stored data actually looks like
+
+The two databases do not store the same representation of a job description. **SQLite stores related structured rows across tables**, while **ChromaDB stores one record per text chunk**. The values below are illustrative examples; UUIDs, timestamps, and embeddings are generated at runtime.
+
+```mermaid
+flowchart TB
+    subgraph SQLITE["A. SQLITE — RELATIONAL TABLES"]
+        direction TB
+        DOC["documents<br/>doc_id: jd-001 (PK)<br/>file_name: google_swe.pdf<br/>status: indexed<br/>content_hash: sha256..."]
+        META["jd_metadata<br/>metadata_id: meta-001 (PK)<br/>doc_id: jd-001 (FK)<br/>company_name: Google<br/>role_title: ML Engineer<br/>job_type: internship<br/>cgpa_cutoff: 7.5<br/>package_ctc: NULL"]
+        SKILLS["jd_skills<br/>id | doc_id | skill | skill_normalized<br/>1 | jd-001 | Python | python<br/>2 | jd-001 | PyTorch | pytorch<br/>3 | jd-001 | SQL | sql"]
+        LOC["jd_locations<br/>id | doc_id | location<br/>1 | jd-001 | Bengaluru"]
+        BRANCH["jd_branches<br/>id | doc_id | branch_code<br/>1 | jd-001 | EE"]
+        ROUNDS["jd_selection_rounds<br/>id | doc_id | round_order | round_name<br/>1 | jd-001 | 1 | Online Assessment<br/>2 | jd-001 | 2 | Technical Interview"]
+        CACHE["embedding_cache<br/>content_hash + model_name (composite PK)<br/>embedding: JSON-encoded float list<br/>cached_at: timestamp"]
+        DOC -->|"one document"| META
+        DOC -->|"one-to-many"| SKILLS
+        DOC -->|"one-to-many"| LOC
+        DOC -->|"one-to-many"| BRANCH
+        DOC -->|"one-to-many"| ROUNDS
+    end
+
+    subgraph CHROMA["B. CHROMADB — CHUNK RECORDS"]
+        direction TB
+        COLLECTION[("Collection: jd_chunks<br/>distance metric: cosine")]
+        RECORD["Record for chunk-001<br/><br/>ID<br/>chunk-001<br/><br/>DOCUMENT<br/>Section: Required Skills<br/>Python, PyTorch and SQL...<br/><br/>METADATA<br/>doc_id: jd-001<br/>chunk_index: 0<br/>chunk_type: text<br/>content_hash: sha256...<br/>section_heading: Required Skills<br/>company_name: Google<br/>role_title: ML Engineer<br/>job_type: internship"]
+        VECTOR["EMBEDDING<br/>384 floating-point values<br/>[0.021, -0.114, 0.008, ..., -0.041]"]
+        COLLECTION --> RECORD
+        RECORD --> VECTOR
+    end
+
+    classDef sql fill:#cffafe,stroke:#0891b2,color:#164e63
+    classDef chroma fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    class DOC,META,SKILLS,LOC,BRANCH,ROUNDS,CACHE sql
+    class COLLECTION,RECORD,VECTOR chroma
+```
+
+**How to read the diagram:**
+
+- **SQLite — `documents`:** one row tracks the source file, its path/name, hash, discovery/indexing timestamps, status, and any failure reason.
+- **SQLite — `jd_metadata`:** one structured metadata row is linked to the document through `doc_id`. Skills, locations, eligible branches, and selection rounds are stored as separate child rows in their own tables, not as one large JSON field.
+- **SQLite — `embedding_cache`:** stores a JSON-encoded embedding list, keyed by the pair `(content_hash, model_name)`. This is a cache for reusing computed vectors; it is separate from the ChromaDB collection.
+- **ChromaDB — `jd_chunks`:** each chunk is upserted with its `chunk_id` as the record ID, original text as the document, the 384-number vector as the embedding, and chunk/document context as metadata. The metadata fields are included when available.
+
+The diagram shows the logical rows and record payloads used by the application; it is not a literal screenshot of SQLite files or ChromaDB's internal on-disk index layout.
+
 **Relevant modules:** `src/storage/sqlite_manager.py` and `src/vector_db/chroma_manager.py`.
 
 ### 5. Hybrid retrieval and rank fusion
