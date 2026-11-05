@@ -906,6 +906,43 @@ flowchart TB
     class ID,DOCUMENT,META,STORE storage
 ```
 
+#### How ChromaDB stores and retrieves a chunk
+
+The following diagram separates the **write path** (adding embedded chunks to a collection) from the **query path** (finding relevant chunks). Each chunk is stored as one logical record, while ChromaDB manages the persistent data and vector-search index behind the collection.
+
+```mermaid
+flowchart TB
+    subgraph WRITE["1. WRITE PATH — ADD A CHUNK"]
+        CHUNK["TextChunk<br/>content + chunk fields"] --> ENCODE["BGE embedding model"]
+        ENCODE --> VECTOR["384-dimensional vector"]
+        CHUNK --> PAYLOAD["Build record"]
+        VECTOR --> PAYLOAD
+        PAYLOAD --> RECORD["One ChromaDB record<br/>ID: chunk_id<br/>Document: original content<br/>Embedding: vector<br/>Metadata: doc_id, section, company, role..."]
+        RECORD --> COLLECTION[("ChromaDB collection<br/>jd_chunks")]
+        COLLECTION --> PERSIST["Persistent storage<br/>records + vector-search index"]
+    end
+
+    subgraph QUERY["2. QUERY PATH — RETRIEVE MATCHING CHUNKS"]
+        QUESTION["User question"] --> QENCODE["Same BGE embedding model"]
+        QENCODE --> QVECTOR["Query vector"]
+        QVECTOR --> SEARCH["ChromaDB similarity search"]
+        FILTER["Optional metadata filter<br/>e.g. company_name = Google"] --> SEARCH
+        PERSIST --> SEARCH
+        SEARCH --> RESULTS["Top matching records<br/>text + metadata + distance"]
+    end
+
+    classDef input fill:#dbeafe,stroke:#2563eb,color:#172554
+    classDef process fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef vector fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef storage fill:#cffafe,stroke:#0891b2,color:#164e63
+    class CHUNK,QUESTION input
+    class ENCODE,PAYLOAD,QENCODE,SEARCH,FILTER process
+    class VECTOR,QVECTOR vector
+    class RECORD,COLLECTION,PERSIST,RESULTS storage
+```
+
+For a query, the application embeds the question with the same embedding model and asks the collection for nearest matching records. Metadata filters can narrow the search (for example, to a particular company); the returned records provide the original chunk text and its metadata as evidence.
+
 The embedding pipeline also uses a SQLite cache keyed by the SHA-256 hash of the chunk text and the embedding model name. If the same content has already been embedded with the same model, the cached vector can be reused instead of running the model again. The cache is separate from ChromaDB's searchable chunk records.
 
 **Implementation detail:** the chunker estimates tokens using approximately `1.3 × whitespace-separated word count`, rather than a model tokenizer. Although the configuration exposes `chunk_overlap: 60`, the current implementation carries over previous paragraph(s) or sentence fragments when starting the next chunk; it does not enforce an exact 60-token overlap. The README's 60-token value is therefore the configured target, not a guaranteed measured overlap.
